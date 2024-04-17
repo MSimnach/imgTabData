@@ -12,3 +12,4 @@ RoxygenNote: 7.3.1
 Imports: 
     torch,
     zen4R
+Config/Needs/website: rmarkdown
