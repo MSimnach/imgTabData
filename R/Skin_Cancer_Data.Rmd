@@ -1,0 +1,371 @@
+---
+title: "Pediatric Skin Cancer Images and EHRs Analysis with DNCIT"
+author: "Your Name"
+date: "2024-06-13"
+output: html_document
+---
+
+# Introduction
+
+This document demonstrates how to apply the deep nonparametric conditional independence test (DNCIT) to pediatric skin cancer images and electronic health records (EHRs). The analysis will showcase potential challenges and research questions.
+
+# Setup
+
+Install the necessary libraries. Ensure Python is installed in your Anaconda environment and the `reticulate` package is set up correctly in R.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+library(dplyr)
+# Use the base conda environment
+use_condaenv("base", required = TRUE)
+```
+
+Load the required libraries in Python:
+
+```{python}
+import os
+import shutil
+from PIL import Image
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import open_clip
+import tensorly as tl
+from tensorly.decomposition import parafac
+
+warnings.filterwarnings('ignore')
+```
+
+# Load and Preprocess Data
+
+Specify the local data directory and load the metadata:
+
+```{r}
+# Set your local data path here
+pediatric_data_path <- "C:/Users/huoqingz/Desktop/PAD-UFES-20"
+meta_data_path <- file.path(pediatric_data_path, 'metadata.csv')
+meta_data <- read.csv(meta_data_path)
+
+# Fill missing values with "EMPTY"
+meta_data[is.na(meta_data)] <- "EMPTY"
+```
+
+Convert the metadata into a usable format:
+
+```{r}
+# Define clinical features
+clin_feats <- c("smoke", "drink", "background_father", "background_mother", "age", "pesticide", "gender", 
+                "skin_cancer_history", "cancer_history", "has_piped_water", "has_sewage_system", "fitspatrick", 
+                "region", "diameter_1", "diameter_2", "itch", "grew", "hurt", "changed", "bleed", "elevation")
+
+# Initialize a list for new clinical feature columns
+new_cli_cols <- c()
+
+# Iterate over the clinical feature list
+for (c in clin_feats) {
+  if (c %in% c("age", "diameter_1", "diameter_2")) {
+    new_cli_cols <- c(new_cli_cols, c)
+  } else {
+    vals <- paste0(c, "_", unique(meta_data[[c]]))
+    vals <- vals[vals != paste0(c, "_EMPTY")]
+    new_cli_cols <- c(new_cli_cols, vals)
+  }
+}
+
+# Create an empty dictionary to store the new data
+new_df <- as.data.frame(matrix(0, ncol = length(new_cli_cols), nrow = nrow(meta_data)))
+colnames(new_df) <- new_cli_cols
+
+# Iterate over each row of metadata
+for (i in 1:nrow(meta_data)) {
+  row <- meta_data[i, ]
+  aux <- c()
+  aux_in <- c()
+  for (col in clin_feats) {
+    data_row <- row[[col]]
+    if (data_row != 'EMPTY') {
+      if (col %in% c("age", "diameter_1", "diameter_2")) {
+        aux_in <- c(aux_in, col)
+        new_df[i, col] <- data_row
+      } else {
+        aux <- c(aux, paste0(col, "_", data_row))
+      }
+    }
+  }
+  for (x in new_cli_cols) {
+    if (x %in% aux) {
+      new_df[i, x] <- 1
+    }
+  }
+}
+
+# Add clinical feature columns to the DataFrame
+meta_data_processed <- cbind(meta_data[, c("img_id", "diagnostic", "patient_id", "lesion_id", "biopsed")], new_df)
+```
+
+# Load and Preprocess Images
+
+Specify the data directory and load the images:
+
+```{python}
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load CLIP model and preprocessing function
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+
+# Specify data directory path
+path_to_data = 'C:\\Users\\huoqingz\\Desktop\\PAD-UFES-20'
+
+# Define target folder
+destination_folder = 'all_images'
+
+# Create target folder
+os.makedirs(destination_folder, exist_ok=True)
+
+# Define a function to move files to the destination folder
+def move_files_to_dest_folder(path, dest):
+    for root, _, files in os.walk(path):
+        for file in files:
+            src_file = os.path.join(root, file)
+            dest_file = os.path.join(dest, file)
+            shutil.copy(src_file, dest_file)
+
+# Move files from each subfolder to the destination folder
+move_files_to_dest_folder(os.path.join(path_to_data, 'images', 'imgs_part_1'), destination_folder)
+move_files_to_dest_folder(os.path.join(path_to_data, 'images', 'imgs_part_2'), destination_folder)
+move_files_to_dest_folder(os.path.join(path_to_data, 'images', 'imgs_part_3'), destination_folder)
+
+# Print the number of files in the destination folder
+print(len(os.listdir(destination_folder)))
+```
+
+Preprocess images and extract features using CLIP:
+
+```{python}
+# Get list of image files
+image_files = [os.path.join(destination_folder, f) for f in os.listdir(destination_folder) if f.endswith('.jpg') or f.endswith('.png')]
+
+# Preprocess images and extract features
+def preprocess_images(image_paths):
+    images = []
+    original_sizes = []
+    for image_path in image_paths:
+        try:
+            image = Image.open(image_path)
+            original_sizes.append(image.size)  # Save original sizes
+            images.append(preprocess(image).unsqueeze(0))
+        except Exception as e:
+            print(f"Error processing image {image_path}: {e}")
+    return torch.cat(images).to(device), original_sizes
+
+# Batch feature extraction function
+def extract_features(image_files, batch_size=32):
+    all_features = []
+    all_sizes = []
+    num_batches = len(image_files) // batch_size + (1 if len(image_files) % batch_size != 0 else 0)
+
+    for i in range(num_batches):
+        batch_files = image_files[i * batch_size:(i + 1) * batch_size]
+        images, sizes = preprocess_images(batch_files)
+        
+        with torch.no_grad():
+            image_features = model.encode_image(images)
+        
+        all_features.append(image_features.cpu().numpy())
+        all_sizes.extend(sizes)
+        print(f"Processed batch {i+1}/{num_batches}")
+    
+    return np.concatenate(all_features, axis=0), all_sizes
+
+# Extract features for all images
+print("Starting feature extraction...")
+image_features, image_sizes = extract_features(image_files)
+print("Feature extraction completed.")
+```
+
+# Dimensionality Reduction with TOCA
+
+Apply TOCA to reduce the dimensionality of the extracted features:
+
+```{python}
+# Use TOCA for dimensionality reduction
+# Reduce 512-dimensional features to 16 dimensions
+rank = 16
+
+# TOCA decomposition
+core, factors = parafac(image_features, rank=rank)
+
+# Print TOCA decomposition results
+print("Core tensor shape:", core.shape)
+for i, factor in enumerate(factors):
+    print(f"Factor matrix {i} shape:", factor.shape)
+
+# Extract reduced features
+toca_features = factors[0]
+
+# Save TOCA decomposed features as numpy array
+np.save('features_toca.npy', toca_features)
+print("TOCA decomposed features saved to features_toca.npy")
+
+# Print original image sizes and TOCA feature dimensions
+print(f"Example original size: {image_sizes[0]}")
+print(f"Example TOCA feature shape: {toca_features.shape}")
+```
+
+# Merge Features with Metadata
+
+Load metadata and merge with the reduced features:
+
+```{r}
+np <- import("numpy")
+
+# Load TOCA decomposed features
+toca_features <- np$load('skin_features_toca.npy')
+
+# Convert features to DataFrame
+feature_columns <- paste0('feature_', 1:ncol(toca_features))
+features_df <- as.data.frame(toca_features)
+colnames(features_df) <- feature_columns
+
+# Merge image features with metadata
+metadata_combined <- cbind(meta_data_processed, features_df)
+
+# Save merged data
+write.csv(metadata_combined, file.path(pediatric_data_path, 'metadata_with_toca_features.csv'), row.names = FALSE)
+print("Combined metadata and features saved to metadata_with_toca_features.csv")
+
+# Print merged table
+print(head(metadata_combined))
+```
+
+# Conditional Independence Test
+
+Apply DNCIT to test for conditional associations between images and diagnosis given EHRs:
+
+```{r}
+# Define non-image-derived EHR columns based on the actual column names in the dataframe
+non_image_columns <- c("age", "background_father_POMERANIA", "background_father_GERMANY", 
+                       "background_father_BRAZIL", "background_father_NETHERLANDS", "background_father_ITALY", 
+                       "background_father_POLAND", "background_father_PORTUGAL", "background_father_AUSTRIA", 
+                       "background_mother_POMERANIA", "background_mother_ITALY", "background_mother_GERMANY", 
+                       "background_mother_BRAZIL", "background_mother_POLAND", "background_mother_PORTUGAL", 
+                       "background_mother_NETHERLANDS", "background_mother_FRANCE", "background_mother_SPAIN", 
+                       "smoke_False", "smoke_True", "drink_False", "drink_True", "pesticide_False", "pesticide_True", 
+                       "gender_FEMALE", "gender_MALE", "skin_cancer_history_True", "skin_cancer_history_False", 
+                       "cancer_history_True", "cancer_history_False", "has_piped_water_True", "has_piped_water_False", 
+                       "has_sewage_system_True", "has_sewage_system_False", "fitspatrick_1", "fitspatrick_2", 
+                       "fitspatrick_3", "fitspatrick_4", "fitspatrick_5", "fitspatrick_6", "region_ARM", 
+                       "region_NECK", "region_FACE", "region_HAND", "region_FOREARM", "region_CHEST", "region_NOSE", 
+                       "region_THIGH", "region_SCALP", "region_EAR", "region_BACK", "region_FOOT", "region_ABDOMEN", 
+                       "region_LIP", "itch_False", "itch_True", "grew_False", "grew_True", "hurt_False", "hurt_True", 
+                       "changed_False", "changed_True", "bleed_False", "bleed_True", "elevation_False", "elevation_True")
+
+# Filter the non-image-derived EHRs that actually exist in the dataframe
+existing_non_image_columns <- non_image_columns[non_image_columns %in% colnames(metadata_combined)]
+
+# Print the columns that will be used for Z
+print("Columns used for Z:")
+print(existing_non_image_columns)
+
+```
+
+```{r}
+# Create Z matrix manually
+Z <- metadata_combined[, existing_non_image_columns, drop = FALSE]
+
+# Convert Z to a matrix
+Z_mat <- as.matrix(Z)
+
+# Load TOCA features using reticulate
+np <- import("numpy")
+features_toca <- np$load('skin_features_toca.npy')
+
+# Convert TOCA features to a DataFrame
+feature_columns <- paste0('feature_', 1:ncol(features_toca))
+X <- as.data.frame(features_toca)
+colnames(X) <- feature_columns
+
+# Define Y matrix (diagnostic)
+Y <- as.matrix(metadata_combined$diagnostic)
+
+# Print the first few rows of X, Y, and Z
+print("X (TOCA features):")
+print(head(X))
+
+print("Y (diagnostic):")
+print(head(Y))
+
+print("Z (non-image-derived EHRs):")
+print(head(Z_mat))
+
+```
+
+# Diagnostic Variable
+
+The `diagnostic` variable represents the classification of the skin lesion diagnosis. The possible values and their meanings are as follows:
+
+-   **ACK**: Actinic Keratosis, a rough, scaly patch on the skin caused by years of sun exposure, considered precancerous.
+-   **BCC**: Basal Cell Carcinoma, the most common type of skin cancer that arises from the basal cells in the skin's lowest layer.
+-   **MEL**: Malignant Melanoma, a serious form of skin cancer that begins in cells known as melanocytes.
+-   **NEV**: Nevus, a type of benign (non-cancerous) growth.
+-   **SCC**: Squamous Cell Carcinoma, a type of skin cancer that begins in the squamous cells.
+-   **SEK**: Seborrheic Keratosis, a non-cancerous skin growth that originates from keratinocytes.
+
+# Metadata Attribute Description
+
+Here provides detailed descriptions of each attribute present in the metadata CSV file used in the PAD-UFES-20 dataset.
+
+patient_id - Description: A string representing the patient ID. - Example: PAT_1234
+
+lesion_id - Description: A string representing the lesion ID. - Example: 123
+
+img_id - Description: A string representing the image ID, which is a composition of the patient ID, lesion ID, and a random number. - Example: PAT_1234_123_000
+
+smoke - Description: A boolean indicating if the patient smokes cigarettes. - Values: True (if the patient smokes), False (if the patient does not smoke)
+
+drink - Description: A boolean indicating if the patient consumes alcoholic beverages. - Values: True (if the patient drinks), False (if the patient does not drink)
+
+background_father and background_mother - Description: Strings representing the country of descent of the patient's father and mother. - Note: Many patients descend from Pomerania, a region between Poland and Germany. Although it is not a country, the nomenclature is kept as they identify themselves as Pomeranians descendants. - Examples: POMERANIA, GERMANY, BRAZIL, etc.
+
+age - Description: An integer representing the patient’s age.
+
+pesticide - Description: A boolean indicating if the patient uses pesticides. - Values: True (if the patient uses pesticides), False (if the patient does not use pesticides)
+
+gender - Description: A string representing the patient’s gender. - Values: FEMALE, MALE
+
+skin_cancer_history - Description: A boolean indicating if the patient or someone in their family has had skin cancer in the past. - Values: True (if there is a history of skin cancer), False (if there is no history of skin cancer)
+
+cancer_history - Description: A boolean indicating if the patient or someone in their family has had any type of cancer in the past. - Values: True (if there is a history of cancer), False (if there is no history of cancer)
+
+has_piped_water - Description: A boolean indicating if the patient has access to piped water in their home. - Values: True (if the patient has access), False (if the patient does not have access)
+
+has_sewage_system - Description: A boolean indicating if the patient has access to a sewage system in their home. - Values: True (if the patient has access), False (if the patient does not have access)
+
+fitspatrick - Description: An integer representing the Fitzpatrick skin type. The Fitzpatrick scale classifies skin types based on their response to UV light. - Values: Ranges from 1 to 6
+
+region - Description: A string representing one of the 15 macro-regions where the lesion is located. - Examples: ARM, NECK, FACE, etc.
+
+diameter_1 and diameter_2 - Description: Floats representing the skin lesions’ horizontal and vertical diameters.
+
+diagnostic - Description: A string representing the skin lesion diagnostic. - Values: BCC (Basal Cell Carcinoma), SCC (Squamous Cell Carcinoma), ACK (Actinic Keratosis), SEK (Seborrheic Keratosis), MEL (Malignant Melanoma), or NEV (Nevus)
+
+itch - Description: A boolean indicating if the skin lesion itches. - Values: True (if the lesion itches), False (if the lesion does not itch)
+
+grew - Description: A boolean indicating if the skin lesion has recently grown. - Values: True (if the lesion has grown), False (if the lesion has not grown)
+
+hurt - Description: A boolean indicating if the skin lesion hurts. - Values: True (if the lesion hurts), False (if the lesion does not hurt)
+
+changed - Description: A boolean indicating if the skin lesion has recently changed. - Values: True (if the lesion has changed), False (if the lesion has not changed)
+
+bleed - Description: A boolean indicating if the skin lesion has bled. - Values: True (if the lesion has bled), False (if the lesion has not bled)
+
+elevation - Description: A boolean indicating if the skin lesion has an elevation. - Values: True (if the lesion has an elevation), False (if the lesion does not have an elevation)
+
+biopsed - Description: A boolean indicating if the diagnostic comes from clinical consensus or biopsy. - Values: True (if the diagnostic is biopsy-proven), False (if the diagnostic is from clinical consensus)
+
+# References
+
+Pacheco AGC, Lima GR, Salomão AS, et al. PAD-UFES-20: A skin lesion dataset composed of patient data and clinical images collected from smartphones. Data Brief. 2020;32:106221. Published 2020 Aug 25. <doi:10.1016/j.dib.2020.106221>
