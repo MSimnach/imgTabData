@@ -1,0 +1,229 @@
+---
+title: "COVID-19 Chest X-ray Data Processing"
+date: "2024-04-11"
+output: html_document
+---
+
+
+## Introduction
+
+This document describes the process of loading and preprocessing the COVID-19 chest X-ray dataset, extracting features using the CLIP model, reducing dimensions using TOCA, and preparing the data for conditional independence testing.
+
+## Setup
+
+Install necessary packages and libraries:
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install and load necessary R packages
+if (!requireNamespace("reticulate", quietly = TRUE)) install.packages("reticulate")
+if (!requireNamespace("torch", quietly = TRUE)) install.packages("torch")
+if (!requireNamespace("torchvision", quietly = TRUE)) install.packages("torchvision")
+if (!requireNamespace("tensorly", quietly = TRUE)) install.packages("tensorly")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+
+library(reticulate)
+library(dplyr)
+```
+
+
+## Load the COVID-19 Chest X-ray Dataset
+
+Clone the dataset repository and load the data using `torchxrayvision`:
+
+```{python, message=FALSE}
+import torchxrayvision as xrv
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import os
+from PIL import Image
+import shutil
+import torch
+from torchvision import transforms
+from tqdm import tqdm
+import tensorly as tl
+from tensorly.decomposition import parafac
+
+# Clone the dataset repository
+!git clone https://github.com/ieee8023/covid-chestxray-dataset
+
+# Load the dataset
+d = xrv.datasets.COVID19_Dataset(imgpath="covid-chestxray-dataset/images/", csvpath="covid-chestxray-dataset/metadata.csv")
+
+# Show a sample image
+sample = d[10]
+plt.imshow(sample["img"][0], cmap="gray")
+plt.show()
+
+# Print full details about the image from the CSV
+print(d.csv.iloc[0])
+
+```
+
+## Extract Image Features using CLIP
+
+Load the CLIP model and extract features from the images:
+
+```{python}
+import open_clip
+from tqdm import tqdm
+
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load CLIP model and preprocessing function
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+
+# Define a function to extract features
+def extract_features(image_paths):
+    features = []
+    for path in tqdm(image_paths):
+        image = preprocess(Image.open(path)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feature = model.encode_image(image).cpu().numpy()
+        features.append(feature)
+    return np.vstack(features)
+
+# Extract features from all images
+image_paths = [os.path.join("covid-chestxray-dataset/images/", f) for f in d.csv['filename']]
+image_features = extract_features(image_paths)
+np.save('covid_features_clip.npy', image_features)
+```
+
+## Dimension Reduction using TOCA
+
+Apply TOCA to reduce the dimensionality of the extracted features:
+
+```{python}
+from tqdm import tqdm
+import tensorly as tl
+from tensorly.decomposition import parafac
+
+# Use TOCA for dimensionality reduction
+# Reduce 512-dimensional features to 16 dimensions
+rank = 16
+
+# TOCA decomposition
+core, factors = parafac(image_features, rank=rank)
+
+# Print TOCA decomposition results
+print("Core tensor shape:", core.shape)
+for i, factor in enumerate(factors):
+    print(f"Factor matrix {i} shape:", factor.shape)
+
+# Extract reduced features
+toca_features = factors[0]
+
+# Save TOCA decomposed features as numpy array
+np.save('features_toca.npy', toca_features)
+print("TOCA decomposed features saved to features_toca.npy")
+
+# Print original image sizes and TOCA feature dimensions
+print(f"Example original size: {d[0]['img'][0].shape}")
+print(f"Example TOCA feature shape: {toca_features.shape}")
+
+```
+
+## Prepare Data for Conditional Independence Testing
+
+First, let's ensure the metadata is correctly processed and clinical features are selected.
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+
+# Inspect column names
+colnames(meta_data_processed)
+
+# Define clinical features based on available columns
+clin_feats <- c("patient_id", "offset", "sex", "age", "finding", "RT_PCR_positive", "survival", 
+                "intubated", "went_icu", "needed_supplemental_O2", "extubated", "temperature", 
+                "pO2_saturation", "wbc_count", "neutrophil_count", "lymphocyte_count", "view", 
+                "modality", "date", "location")
+
+# Check which of the clin_feats exist in meta_data_processed
+clin_feats_existing <- clin_feats[clin_feats %in% colnames(meta_data_processed)]
+
+# Select the clinical attributes
+Z <- meta_data_processed %>% select(all_of(clin_feats_existing))
+
+# Convert categorical variables to one-hot encoding
+Z <- Z %>%
+  mutate(across(where(is.character), ~ as.factor(.))) %>%
+  mutate(across(where(is.factor), ~ as.numeric(as.factor(.))))
+
+# Handle missing values
+Z[is.na(Z)] <- "EMPTY"
+
+# Print the first few rows of Z
+head(Z)
+```
+
+### Python Script for Combining TOCA Features with Metadata
+
+Now, let's proceed with the Python script to load TOCA features, preprocess metadata, and combine both.
+
+```{python}
+import pandas as pd
+import numpy as np
+
+# Load TOCA features
+toca_features = np.load('features_toca.npy')
+
+# Load the metadata
+metadata = pd.read_csv("covid-chestxray-dataset/metadata.csv")
+
+
+# Define X, Y, Z for conditional independence testing
+X = toca_features
+Y = metadata['finding'].values.reshape(-1, 1)  # Assuming 'finding' is the outcome variable
+
+print("X (TOCA features):", X)
+print("Y (diagnostic):", Y)
+```
+
+### Explanation of Target Value \( Y \) and Attributes of \( Z \)
+
+#### Target Value \( Y \)
+
+- **Diagnostic**:
+  - **Description**: The diagnostic outcome or label for each patient.
+  - **Examples**: "Pneumonia/Viral/COVID-19", "Pneumonia/Bacterial/Streptococcus", "No Finding".
+
+#### Attributes of \( Z \)
+
+- **patientid**: Internal identifier for the patient.
+- **offset**: Number of days since the start of symptoms or hospitalization for each image.
+- **sex**: Gender of the patient (Male (M), Female (F), or blank).
+- **age**: Age of the patient in years.
+- **finding**: Type of pneumonia or diagnosis.
+- **RT_PCR_positive**: RT-PCR test result for COVID-19 (Yes (Y), No (N), or blank if not reported/taken).
+- **survival**: Indicates if the patient survived (Yes (Y), No (N), or blank if unknown).
+- **intubated**: Indicates if the patient was intubated (Yes (Y) or No (N)).
+- **went_icu**: Indicates if the patient was in the ICU (Yes (Y) or No (N)).
+- **needed_supplemental_O2**: Indicates if the patient required supplemental oxygen (Yes (Y) or No (N)).
+- **extubated**: Indicates if the patient was successfully extubated (Yes (Y) or No (N)).
+- **temperature**: Temperature of the patient in Celsius at the time of the image.
+- **pO2_saturation**: Partial pressure of oxygen saturation in percentage.
+- **wbc_count**: White blood cell count in units of 10^3/uL.
+- **neutrophil_count**: Neutrophil cell count in units of 10^3/uL.
+- **lymphocyte_count**: Lymphocyte cell count in units of 10^3/uL.
+- **view**: View type for the X-ray or CT scan (Posteroanterior (PA), Anteroposterior (AP), AP Supine (APS), or Lateral (L)).
+- **modality**: Type of imaging used (CT, X-ray, or other).
+- **date**: Date on which the image was acquired.
+- **location**: Hospital name, city, state, country where the image was taken.
+
+
+## References
+
+COVID-19 Image Data Collection: Prospective Predictions Are the Future
+Joseph Paul Cohen and Paul Morrison and Lan Dao and Karsten Roth and Tim Q Duong and Marzyeh Ghassemi
+arXiv:2006.11988, https://github.com/ieee8023/covid-chestxray-dataset, 2020
+
+COVID-19 image data collection, arXiv:2003.11597, 2020
+Joseph Paul Cohen and Paul Morrison and Lan Dao
+https://github.com/ieee8023/covid-chestxray-dataset
+
